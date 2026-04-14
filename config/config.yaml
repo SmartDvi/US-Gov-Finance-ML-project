@@ -1,0 +1,119 @@
+# ============================================================
+#  Government Finance ML — Master Configuration
+#  Target Runtime: Databricks (DBR 14.x / Spark 3.5)
+# ============================================================
+
+project:
+  name: "gov_finance_ml"
+  version: "1.0.0"
+  description: "State-level government finance analytics & ML pipeline"
+
+databricks:
+  catalog: "gov_finance"
+  schema: "silver"
+  raw_schema: "bronze"
+  gold_schema: "gold"
+  checkpoint_path: "dbfs:/checkpoints/gov_finance"
+  model_registry_uri: "databricks"   # uses Unity Catalog model registry
+
+mlflow:
+  experiment_base: "/Shared/gov_finance_ml"
+  registered_model_prefix: "gov_finance"
+  tracking_uri: "databricks"          # auto-resolved inside Databricks
+  artifact_location: "dbfs:/mlflow/gov_finance"
+
+data:
+  raw_table: "bronze.state_finances_raw"
+  silver_table: "silver.state_finances"
+  gold_table: "gold.state_finances_features"
+  target_revenue_col: "totals_revenue"
+  target_expenditure_col: "totals_expenditure"
+  id_cols: ["state", "year"]
+  min_year: 1992
+  max_year: 2019
+  train_cutoff_year: 2014          # years > 2014 → test set
+
+feature_engineering:
+  lag_windows: [1, 2, 3, 5]
+  rolling_windows: [3, 5]
+  ratio_pairs:
+    - ["totals_expenditure", "totals_revenue"]
+    - ["totals_debt_at_end_of_fiscal_year", "totals_revenue"]
+    - ["details_welfare_welfare_institution_total_expenditure", "totals_general_expenditure"]
+    - ["details_transportation_highways_highways_total_expenditure", "totals_capital_outlay"]
+    - ["details_police_protection", "totals_general_expenditure"]
+
+models:
+  fiscal_forecaster:
+    name: "fiscal_health_forecaster"
+    horizon_years: 5
+    freq: "Y"
+    prophet:
+      changepoint_prior_scale: [0.01, 0.05, 0.1, 0.3]
+      seasonality_prior_scale: [0.1, 1.0, 10.0]
+      seasonality_mode: ["additive", "multiplicative"]
+    xgb:
+      n_estimators: [100, 300, 500]
+      max_depth: [3, 5, 7]
+      learning_rate: [0.01, 0.05, 0.1]
+      subsample: [0.7, 0.9]
+
+  anomaly_detector:
+    name: "fiscal_anomaly_detector"
+    isolation_forest:
+      n_estimators: 200
+      contamination: 0.05
+      random_state: 42
+    autoencoder:
+      encoding_dim: [32, 16, 8]
+      epochs: 100
+      batch_size: 32
+      threshold_percentile: 95
+    features:
+      - "totals_capital_outlay"
+      - "totals_revenue"
+      - "totals_expenditure"
+      - "details_interest_on_general_debt"
+      - "details_miscellaneous_general_revenue"
+      - "details_other_taxes"
+
+  clustering:
+    name: "state_financial_clusters"
+    k_range: [3, 4, 5, 6, 7, 8]
+    random_state: 42
+    features:
+      - "totals_license_tax"
+      - "totals_intergovernmental"
+      - "totals_insurance_trust_revenue"
+      - "details_welfare_welfare_institution_total_expenditure"
+      - "details_natural_resources_parks_parks_total_expenditure"
+      - "details_transportation_highways_highways_total_expenditure"
+      - "details_police_protection"
+      - "debt_to_revenue_ratio"
+      - "welfare_expenditure_share"
+      - "highway_expenditure_share"
+
+  optimizer:
+    name: "resource_optimizer"
+    budget_col: "totals_general_revenue"
+    objective_weights:
+      minimize_debt: 0.35
+      maximize_welfare: 0.30
+      maximize_infrastructure: 0.20
+      maximize_public_safety: 0.15
+    constraint_bounds:
+      welfare_min_share: 0.08
+      welfare_max_share: 0.30
+      highway_min_share: 0.05
+      highway_max_share: 0.25
+      police_min_share: 0.02
+      police_max_share: 0.15
+    ga:
+      population_size: 200
+      generations: 150
+      crossover_rate: 0.85
+      mutation_rate: 0.12
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s | %(levelname)s | %(name)s | %(message)s"

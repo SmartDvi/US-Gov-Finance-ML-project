@@ -1,0 +1,144 @@
+{
+  "name": "gov_finance_ml_production_pipeline",
+  "description": "Government Finance ML — Full Bronze→Silver→Gold→Models pipeline",
+  "tags": {
+    "project": "gov_finance_ml",
+    "environment": "production",
+    "team": "data-science"
+  },
+  "job_clusters": [
+    {
+      "job_cluster_key": "primary_cluster",
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "i3.xlarge",
+        "driver_node_type_id": "i3.xlarge",
+        "num_workers": 4,
+        "autoscale": {
+          "min_workers": 2,
+          "max_workers": 8
+        },
+        "spark_conf": {
+          "spark.sql.adaptive.enabled": "true",
+          "spark.sql.adaptive.coalescePartitions.enabled": "true",
+          "spark.databricks.delta.preview.enabled": "true",
+          "spark.databricks.cluster.profile": "serverless"
+        },
+        "spark_env_vars": {
+          "ENV": "production",
+          "PYTHONPATH": "/Workspace/Repos/gov_finance_ml"
+        },
+        "libraries": [
+          { "pypi": { "package": "prophet==1.1.5" } },
+          { "pypi": { "package": "xgboost==2.0.3" } },
+          { "pypi": { "package": "scikit-learn==1.4.2" } },
+          { "pypi": { "package": "pyyaml==6.0.1" } }
+        ],
+        "azure_attributes": {
+          "availability": "SPOT_WITH_FALLBACK_AZURE",
+          "spot_bid_max_price": 100
+        },
+        "aws_attributes": {
+          "availability": "SPOT_WITH_FALLBACK",
+          "spot_bid_price_percent": 80
+        }
+      }
+    }
+  ],
+  "tasks": [
+    {
+      "task_key": "01_data_ingestion",
+      "description": "Ingest raw CSV → Bronze Delta, run Silver preprocessing",
+      "job_cluster_key": "primary_cluster",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Repos/gov_finance_ml/notebooks/01_data_ingestion",
+        "base_parameters": {
+          "raw_csv_path": "dbfs:/FileStore/gov_finance/state_finances_raw.csv"
+        }
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 2,
+      "min_retry_interval_millis": 60000,
+      "retry_on_timeout": false
+    },
+    {
+      "task_key": "02_feature_engineering",
+      "description": "Silver → Gold feature engineering",
+      "depends_on": [{ "task_key": "01_data_ingestion" }],
+      "job_cluster_key": "primary_cluster",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Repos/gov_finance_ml/notebooks/02_feature_engineering"
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 1
+    },
+    {
+      "task_key": "03_fiscal_forecasting",
+      "description": "Train Prophet + XGBoost fiscal forecasters (parallel sweep)",
+      "depends_on": [{ "task_key": "02_feature_engineering" }],
+      "job_cluster_key": "primary_cluster",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Repos/gov_finance_ml/notebooks/03_fiscal_forecasting"
+      },
+      "timeout_seconds": 7200,
+      "max_retries": 1
+    },
+    {
+      "task_key": "04_anomaly_detection",
+      "description": "Train Isolation Forest + Autoencoder anomaly detectors",
+      "depends_on": [{ "task_key": "02_feature_engineering" }],
+      "job_cluster_key": "primary_cluster",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Repos/gov_finance_ml/notebooks/04_anomaly_detection"
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 1
+    },
+    {
+      "task_key": "05_state_clustering",
+      "description": "K-Means state clustering with optimal K selection",
+      "depends_on": [{ "task_key": "02_feature_engineering" }],
+      "job_cluster_key": "primary_cluster",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Repos/gov_finance_ml/notebooks/05_state_clustering"
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 1
+    },
+    {
+      "task_key": "06_resource_optimization",
+      "description": "Genetic Algorithm Pareto-optimal budget allocation",
+      "depends_on": [
+        { "task_key": "03_fiscal_forecasting" },
+        { "task_key": "04_anomaly_detection" },
+        { "task_key": "05_state_clustering" }
+      ],
+      "job_cluster_key": "primary_cluster",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Repos/gov_finance_ml/notebooks/06_resource_optimization"
+      },
+      "timeout_seconds": 10800,
+      "max_retries": 1
+    }
+  ],
+  "schedule": {
+    "quartz_cron_expression": "0 0 2 1 * ?",
+    "timezone_id": "UTC",
+    "pause_status": "UNPAUSED"
+  },
+  "email_notifications": {
+    "on_start": [],
+    "on_success": ["data-science@yourorg.com"],
+    "on_failure": ["data-science@yourorg.com", "oncall@yourorg.com"],
+    "no_alert_for_skipped_runs": false
+  },
+  "webhook_notifications": {
+    "on_failure": [
+      {
+        "id": "your-pagerduty-webhook-id"
+      }
+    ]
+  },
+  "max_concurrent_runs": 1,
+  "format": "MULTI_TASK"
+}
