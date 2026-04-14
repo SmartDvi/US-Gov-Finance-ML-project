@@ -249,5 +249,3 @@ ruff check src/ tests/
 
 ---
 
-## License
-MIT © 2024 Your Organization
