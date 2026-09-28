@@ -5,6 +5,20 @@ build/
 dist/
 wheels/
 *.egg-info
+.pytest_cache/
 
 # Virtual environments
 .venv
+
+# Pipeline outputs (regenerate with `uv run python main.py`)
+output/
+
+# Spark local artefacts
+spark-warehouse/
+metastore_db/
+derby.log
+
+# MLflow tracking database and artifacts (regenerate by running the pipeline)
+mlflow.db
+mlartifacts/
+mlruns/

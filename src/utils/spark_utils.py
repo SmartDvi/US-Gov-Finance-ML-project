@@ -1,176 +1,81 @@
 """
-gov_finance_ml/src/utils/spark_utils.py
-Databricks-aware Spark session factory & helpers.
+Shared helpers: config loading, SparkSession creation and parquet I/O.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-import os
 from pathlib import Path
-from typing import Optional
 
 import yaml
-from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import StructType
 
 logger = logging.getLogger(__name__)
 
+# src/utils/spark_utils.py -> parents[2] is the project root
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-# ─────────────────────────────────────────────
-# Configuration loader
-# ─────────────────────────────────────────────
 
-def load_config(path: Optional[str] = None) -> dict:
-    """Load YAML config. Resolves to repo-root config/config.yaml by default."""
-    if path is None:
-        root = Path(__file__).resolve().parents[3]
-        path = root / "config" / "config.yaml"
+def load_config(path: str | Path | None = None) -> dict:
+    """Load the YAML config (defaults to config/config.yaml in the project root)."""
+    path = Path(path) if path else PROJECT_ROOT / "config" / "config.yaml"
     with open(path) as fh:
         return yaml.safe_load(fh)
 
 
-# ─────────────────────────────────────────────
-# SparkSession factory
-# ─────────────────────────────────────────────
-
-def get_spark(app_name: str = "GovFinanceML") -> SparkSession:
-    """
-    Return the active SparkSession.
-    - On Databricks the session already exists; this simply retrieves it.
-    - Locally it creates a local session for unit-tests / development.
-    """
-    builder = (
+def get_spark(config: dict) -> SparkSession:
+    """Create (or reuse) a local SparkSession configured from the config file."""
+    spark_cfg = config["spark"]
+    spark = (
         SparkSession.builder
-        .appName(app_name)
-        .config("spark.sql.adaptive.enabled", "true")
-        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
-        .config("spark.sql.shuffle.partitions", "200")
-        .config("spark.databricks.delta.preview.enabled", "true")
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-        .config(
-            "spark.sql.catalog.spark_catalog",
-            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
-        )
-    )
-
-    # Detect Databricks environment
-    if _is_databricks():
-        logger.info("Databricks runtime detected — reusing active session.")
-        return SparkSession.getActiveSession() or builder.getOrCreate()
-
-    # Local / CI fallback
-    logger.info("Local environment — creating new SparkSession.")
-    return (
-        builder
-        .master("local[*]")
-        .config("spark.driver.memory", "4g")
+        .appName(spark_cfg["app_name"])
+        .master(spark_cfg["master"])
+        .config("spark.driver.memory", spark_cfg["driver_memory"])
+        .config("spark.sql.shuffle.partitions", spark_cfg["shuffle_partitions"])
+        .config("spark.sql.session.timeZone", "UTC")
         .getOrCreate()
     )
+    spark.sparkContext.setLogLevel("WARN")
+    return spark
 
 
-def _is_databricks() -> bool:
-    return "DATABRICKS_RUNTIME_VERSION" in os.environ
+# ── Output paths & I/O ────────────────────────────────────────────
+
+def output_path(config: dict, *parts: str) -> str:
+    """Absolute path inside the configured output directory."""
+    return str(PROJECT_ROOT / config["paths"]["output_dir"] / Path(*parts))
 
 
-# ─────────────────────────────────────────────
-# Delta helpers
-# ─────────────────────────────────────────────
-
-def read_delta(spark: SparkSession, table: str) -> DataFrame:
-    logger.info("Reading Delta table: %s", table)
-    return spark.read.format("delta").table(table)
-
-
-def write_delta(
-    df: DataFrame,
-    table: str,
-    mode: str = "overwrite",
-    partition_by: Optional[list[str]] = None,
-    merge_schema: bool = False,
-) -> None:
-    """Write a DataFrame as a managed Delta table."""
-    logger.info("Writing Delta table: %s  (mode=%s)", table, mode)
-    writer = df.write.format("delta").mode(mode)
+def write_parquet(df: DataFrame, path: str, partition_by: list[str] | None = None) -> None:
+    logger.info("Writing parquet -> %s", path)
+    writer = df.write.mode("overwrite")
     if partition_by:
         writer = writer.partitionBy(*partition_by)
-    if merge_schema:
-        writer = writer.option("mergeSchema", "true")
-    writer.saveAsTable(table)
-    logger.info("Delta write complete → %s", table)
+    writer.parquet(path)
 
 
-def upsert_delta(
-    spark: SparkSession,
-    source_df: DataFrame,
-    target_table: str,
-    merge_keys: list[str],
-) -> None:
-    """
-    Perform a Delta MERGE (upsert) operation.
-    Requires Delta Lake on the cluster.
-    """
-    from delta.tables import DeltaTable  # type: ignore
-
-    key_condition = " AND ".join(
-        f"target.{k} = source.{k}" for k in merge_keys
-    )
-
-    if DeltaTable.isDeltaTable(spark, target_table):
-        delta_tbl = DeltaTable.forName(spark, target_table)
-        (
-            delta_tbl.alias("target")
-            .merge(source_df.alias("source"), key_condition)
-            .whenMatchedUpdateAll()
-            .whenNotMatchedInsertAll()
-            .execute()
-        )
-        logger.info("MERGE complete → %s", target_table)
-    else:
-        write_delta(source_df, target_table, mode="overwrite")
+def read_parquet(spark: SparkSession, path: str) -> DataFrame:
+    logger.info("Reading parquet <- %s", path)
+    return spark.read.parquet(path)
 
 
-# ─────────────────────────────────────────────
-# Schema validation
-# ─────────────────────────────────────────────
-
-def assert_schema(df: DataFrame, expected: StructType, strict: bool = False) -> None:
-    """Raise ValueError when required columns are missing."""
-    expected_fields = {f.name for f in expected.fields}
-    actual_fields = set(df.columns)
-    missing = expected_fields - actual_fields
-    if missing:
-        raise ValueError(f"DataFrame is missing required columns: {missing}")
-    if strict:
-        extra = actual_fields - expected_fields
-        if extra:
-            raise ValueError(f"Unexpected columns in DataFrame: {extra}")
+def write_csv_report(df: DataFrame, path: str) -> None:
+    """Write a small result table as a single CSV file (folder with one part file)."""
+    logger.info("Writing CSV report -> %s", path)
+    df.coalesce(1).write.mode("overwrite").option("header", True).csv(path)
 
 
-# ─────────────────────────────────────────────
-# DataFrame quality helpers
-# ─────────────────────────────────────────────
-
-def null_report(df: DataFrame) -> DataFrame:
-    """Return a single-row DF with null counts per column."""
-    spark = df.sparkSession
-    null_counts = [
-        F.sum(F.col(c).isNull().cast("int")).alias(c) for c in df.columns
-    ]
-    return df.select(null_counts)
+def write_json(obj: dict, path: str) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as fh:
+        json.dump(obj, fh, indent=2, default=str)
+    logger.info("Wrote %s", path)
 
 
-def describe_numeric(df: DataFrame) -> DataFrame:
-    numeric_cols = [
-        f.name for f in df.schema.fields
-        if str(f.dataType) in ("DoubleType", "FloatType", "IntegerType", "LongType")
-    ]
-    return df.select(numeric_cols).describe()
+# ── Column helpers ────────────────────────────────────────────────
 
-
-def add_audit_columns(df: DataFrame) -> DataFrame:
-    """Add ingestion timestamp and a monotonically increasing ID."""
-    return df.withColumn(
-        "_ingested_at", F.current_timestamp()
-    ).withColumn("_row_id", F.monotonically_increasing_id())
+def safe_divide(numerator: Column, denominator: Column) -> Column:
+    """Division that returns null (not infinity or an error) when the denominator is 0 or null."""
+    return F.when(denominator != 0, numerator / denominator)

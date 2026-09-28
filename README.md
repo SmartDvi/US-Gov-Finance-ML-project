@@ -1,251 +1,200 @@
-# Government Finance ML Pipeline
-### Production-Grade PySpark + MLflow + Databricks
+# US State Government Finance — PySpark ML Pipeline
 
-> **Mission:** Transform raw US state government financial data (1992–2019) into actionable policy intelligence using a four-model ML pipeline — fiscal forecasting, anomaly detection, state clustering, and resource optimization.
+An end-to-end **PySpark** pipeline that turns 21 years of US state government
+finance data into three answers that budget analysts and auditors need:
 
----
+| Question | Model | Output |
+|----------|-------|--------|
+| How much general revenue will each state collect next year? | **Revenue forecaster** — Spark ML `RandomForestRegressor` | `reports/revenue_forecast` |
+| Which states are true peers, and where does a state spend differently from them? | **Peer clustering** — Spark ML `KMeans` | `reports/state_clusters`, `reports/cluster_profiles` |
+| Which state-years had unusual swings that deserve an audit? | **Anomaly detection** — robust z-score (median / MAD) in Spark SQL | `reports/anomaly_audit` |
 
-## Architecture Overview
-
-```
-Raw CSV
-  │
-  ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  BRONZE LAYER  (Delta Lake)                                     │
-│  • Schema enforcement & sanitisation                            │
-│  • Auto Loader streaming support                                │
-│  • Audit columns (_ingested_at, _row_id)                        │
-└───────────────────────┬─────────────────────────────────────────┘
-                        │
-                        ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  SILVER LAYER  (Delta Lake)                                     │
-│  • Deduplication  •  Year-range filter                         │
-│  • IQR outlier clipping  •  Rolling median imputation          │
-│  • Data Quality Score (DQS)  •  Train/test split               │
-└───────────────────────┬─────────────────────────────────────────┘
-                        │
-                        ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  GOLD LAYER  (Delta Lake)                                       │
-│  • 60+ features: ratios, YoY growth, lags, rolling stats       │
-│  • Fiscal Health Index  •  Social Investment Score             │
-│  • Debt sustainability flags                                    │
-└──────┬──────────────┬──────────────┬──────────────┬────────────┘
-       │              │              │              │
-       ▼              ▼              ▼              ▼
- ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────┐
- │ MODEL A  │  │ MODEL B  │  │ MODEL C  │  │   MODEL D    │
- │ Fiscal   │  │ Anomaly  │  │ State    │  │  Resource    │
- │ Forecast │  │ Detector │  │Clustering│  │  Optimizer   │
- │          │  │          │  │          │  │              │
- │ Prophet  │  │ Isolation│  │ K-Means  │  │  Genetic     │
- │ XGBoost  │  │ Forest + │  │ (PySpark │  │  Algorithm   │
- │ Pandas   │  │ Autoenc. │  │   ML)    │  │  (Pareto)    │
- │   UDF    │  │ Ensemble │  │          │  │              │
- └────┬─────┘  └────┬─────┘  └────┬─────┘  └──────┬───────┘
-      │              │              │               │
-      └──────────────┴──────────────┴───────────────┘
-                              │
-                              ▼
-                    MLflow Model Registry
-                    (Unity Catalog — @champion)
-```
+Every run is tracked and monitored in **MLflow** (metrics, drift, model registry with
+champion/challenger promotion). Results are explored in a multi-page **Dash**
+dashboard built with Dash Mantine Components and Dash AG Grid.
 
 ---
 
-## Business Insights Addressed
+## Data
 
-| Insight | Model | Output |
-|---------|-------|--------|
-| Social safety-net efficiency | Forecaster + Feature Ratios | `welfare_to_insurance_ratio`, FHI trend |
-| Infrastructure vs. mobility | Optimizer | Optimal highway spend share per state |
-| Public safety vs. community investment | Clustering + Optimizer | `police_vs_parks_ratio` cluster profiles |
-| Fiscal health & future taxation | Forecaster + Anomaly | Debt trajectory + early-warning flags |
+`data/raw/finance.csv`: US Census *Annual Survey of State Government Finances*
+(via CORGIS). One row per state per year, about 30 columns in **thousands of USD**
+(revenue, expenditure, debt, tax, welfare, education, highways, police, ...).
 
----
+Facts about the data that shaped the design:
 
-## Project Structure
-
-```
-gov_finance_ml/
-├── config/
-│   ├── config.yaml              # Master configuration (all tunable params)
-│   └── databricks_job.json      # Databricks multi-task job definition
-│
-├── src/
-│   ├── data/
-│   │   ├── ingestion.py         # Bronze ingestion (CSV, Auto Loader)
-│   │   └── preprocessing.py     # Silver: clean, impute, DQS, split
-│   ├── features/
-│   │   └── feature_engineering.py  # Gold: 60+ features + ML pipeline
-│   ├── models/
-│   │   ├── fiscal_forecaster.py    # Prophet + XGBoost (Model A)
-│   │   ├── anomaly_detector.py     # IF + Autoencoder (Model B)
-│   │   ├── state_clustering.py     # KMeans + profiling (Model C)
-│   │   └── resource_optimizer.py   # Genetic Algorithm (Model D)
-│   └── utils/
-│       ├── spark_utils.py       # Session factory, Delta helpers
-│       └── mlflow_utils.py      # Experiment, run, registry helpers
-│
-├── notebooks/
-│   ├── 01_data_ingestion.py     # Databricks notebook: Bronze + Silver
-│   ├── 02_feature_engineering.py
-│   ├── 03_fiscal_forecasting.py
-│   ├── 04_anomaly_detection.py
-│   ├── 05_state_clustering.py
-│   └── 06_resource_optimization.py
-│
-├── tests/
-│   └── test_pipeline.py         # Unit + integration tests (pytest)
-│
-├── requirements.txt
-├── setup.py
-└── README.md
-```
+| Fact | Consequence |
+|------|-------------|
+| Years **1992–2004 and 2012–2019** (2005–2011 missing) | Growth rates and lags are only computed between consecutive years (`lag_if_consecutive`). A plain `lag()` would call 2004→2012 a one-year change. |
+| Contains a `UNITED STATES` aggregate row | Removed during ingestion; otherwise it would dominate every model. |
+| California's budget is ~100× Wyoming's | Models use **ratios and growth rates**, not raw dollars. |
+| Insurance-trust revenue is sometimes negative (pension investment losses in 2001–2003) | Kept as real data, not clipped. Also the reason the forecaster targets *general* revenue. |
 
 ---
 
-## Quickstart on Databricks
+## Pipeline
 
-### 1. Clone the Repo
-```bash
-# In Databricks Workspace → Repos → Add Repo
-# URL: https://github.com/yourorg/gov_finance_ml
+```text
+data/raw/finance.csv
+        │  Stage 1  src/data/ingestion.py
+        ▼  snake_case columns, typed, "UNITED STATES" removed, validated
+output/clean/state_finances            (parquet)
+        │  Stage 2  src/features/feature_engineering.py
+        ▼  spending shares, revenue mix, fiscal-stress ratios, YoY growth
+output/features/state_finance_features (parquet, 1 row per state-year)
+        │
+        ├── Stage 3a  src/models/fiscal_forecaster.py  → revenue forecast for next year
+        ├── Stage 3b  src/models/state_clustering.py   → peer groups + gaps vs peers
+        └── Stage 3c  src/models/anomaly_detector.py   → audit list with reasons
+                                                          │
+                                         output/reports/*.csv, metrics.json
 ```
 
-### 2. Upload Data
-```bash
-# Upload your CSV to DBFS:
-dbfs cp state_finances_raw.csv dbfs:/FileStore/gov_finance/state_finances_raw.csv
-```
+### Stage 2 — features (all computed with Spark window functions)
 
-### 3. Create Unity Catalog (one-time)
-Run the SQL block in `01_data_ingestion.py`:
-```sql
-CREATE CATALOG IF NOT EXISTS gov_finance;
-CREATE SCHEMA IF NOT EXISTS gov_finance.bronze;
-CREATE SCHEMA IF NOT EXISTS gov_finance.silver;
-CREATE SCHEMA IF NOT EXISTS gov_finance.gold;
-```
+* **Spending shares**: welfare, education, health, highways, police, corrections and parks, each as a share of general expenditure.
+* **Revenue mix**: tax share, intergovernmental (federal aid) dependency, insurance-trust share.
+* **Fiscal stress**: expenditure / revenue, debt / general revenue, interest burden, deficit flag.
+* **Growth**: year-over-year growth of revenue, tax, expenditure, debt, capital outlay, interest and miscellaneous revenue, plus last year's growth and the national average growth for that year.
+* Every feature uses only the current or earlier years, so there is no look-ahead.
 
-### 4. Run Notebooks in Order
-| Notebook | Runtime |
-|----------|---------|
-| `01_data_ingestion` | ~5 min |
-| `02_feature_engineering` | ~8 min |
-| `03_fiscal_forecasting` | ~25 min |
-| `04_anomaly_detection` | ~10 min |
-| `05_state_clustering` | ~12 min |
-| `06_resource_optimization` | ~30 min |
+### Stage 3a — revenue forecaster
 
-### 5. Schedule with Job API
-```bash
-databricks jobs create --json @config/databricks_job.json
-```
+* **Label** = next year's general-revenue *growth rate*. Forecast in dollars = this year's revenue × (1 + predicted growth).
+  Growth rates are used because tree models can't predict values above the training range, and revenue grows every year. Growth rates are also comparable across states.
+* **Time-based split** (never random for time series): train on target years < 2015, pick hyper-parameters on 2015–2016, test once on 2017–2019.
+* The final model is refit on all years and forecasts **2020** for every state.
+* It is always compared with two baselines: *naive* (no change) and *historical average growth*.
+
+### Stage 3b — peer clustering
+
+* One profile per state: the average of 10 budget-structure ratios over the last 5 years.
+* `StandardScaler` → `KMeans` for k = 3…6, choosing the k with the best **silhouette** score.
+* Each cluster is described automatically by its three most distinctive features.
+* **Peer benchmark**: every ratio minus the cluster median, for example `welfare_share_vs_peers`.
+
+### Stage 3c — anomaly detection
+
+* Features: year-over-year growth of revenue, expenditure, capital outlay, debt, interest and miscellaneous revenue.
+* Modified z-score `0.6745 × (x − median) / MAD`. The median and MAD are used because the outliers we're hunting would inflate a mean and standard deviation and hide themselves.
+* A row is flagged when its largest |z| is above 5.0. The `reasons` column names each metric that triggered the flag.
 
 ---
 
-## MLflow Experiment Structure
+## Results (from `output/reports/metrics.json`)
 
-```
-/Shared/gov_finance_ml/
-├── fiscal_forecasting/          # Prophet & XGBoost runs per target
-├── anomaly_detection/           # Ensemble IF + AE runs
-├── state_clustering/            # KMeans K-selection runs
-└── resource_optimization/       # GA optimizer per state
-```
+**Revenue forecaster.** Test years 2017–2019, 150 state-years never seen in training:
 
-**UC Model Registry aliases:**
-- `gov_finance.fiscal_forecaster_totals_revenue@champion`
-- `gov_finance.fiscal_forecaster_totals_expenditure@champion`
-- `gov_finance.anomaly_detector@champion`
-- `gov_finance.state_clustering@champion`
+| Model | Growth MAE (pp) | Revenue MAPE |
+|-------|----------------:|-------------:|
+| Random forest | 2.83 | 2.71 % |
+| Baseline: no change | 4.68 | 4.40 % |
+| Baseline: historical average growth | 2.60 | 2.48 % |
 
----
+On the validation years (2015–2016) the forest beat the average-growth baseline (3.56 vs 3.98 pp).
+On the calmer 2017–2019 test years it is on par with it. So it forecasts next year's revenue within about 2.7 %,
+far better than assuming no change, but the historical trend already explains most of the signal.
+The most important features are national revenue growth, federal-aid dependency and tax share.
 
-## Configuration
+**Peer clustering.** k = 4, silhouette 0.22. For example:
 
-All tuneable parameters are in `config/config.yaml`:
+* **California** spends 41.8 % of its general budget on welfare, **+11.1 pp more than its peer group's median**, and 4.7 pp less on education.
+* **Texas** spends 4.3 pp more than its peers on education, 2.4 pp more on highways, and about the same on welfare.
 
-```yaml
-models:
-  fiscal_forecaster:
-    horizon_years: 5           # Forecast horizon
-    xgb:
-      n_estimators: [100, 300, 500]   # Grid search values
-
-  anomaly_detector:
-    isolation_forest:
-      contamination: 0.05      # Expected anomaly fraction
-
-  clustering:
-    k_range: [3, 4, 5, 6, 7, 8]   # K candidates for elbow / silhouette
-
-  optimizer:
-    objective_weights:
-      minimize_debt: 0.35
-      maximize_welfare: 0.30
-      maximize_infrastructure: 0.20
-      maximize_public_safety: 0.15
-```
+**Anomaly detection.** 55 of 950 state-years flagged (5.8 %). The top of the list includes West Virginia 2018
+(interest on general debt jumped, z = +21.5) and Kansas 2000–2004 (repeated debt and interest spikes).
 
 ---
 
-## Running Tests Locally
+## MLflow tracking and monitoring
+
+Each `main.py` run creates one parent MLflow run (`pipeline`) and a nested run per stage.
+Everything goes into a local SQLite database (`mlflow.db`) with artifacts in `mlartifacts/`.
+
+| Run (tag `stage`) | Params | Metrics | Artifacts |
+|---|---|---|---|
+| `pipeline` | config sections | data quality: rows, states, years, null cells | `metrics.json` |
+| `forecaster` | target, best depth / trees | test MAE/RMSE/MAPE for the model **and** both baselines; drift per feature; prediction summary | Spark model, feature importance, tuning results, forecast CSV |
+| `clustering` | k range, selected k | silhouette (plus a silhouette-by-k curve) | Spark model, cluster reports |
+| `anomaly_detection` | threshold, features | rows scored, anomalies, anomaly rate | fitted medians/MADs, audit list |
+
+**Monitoring on every run** (`src/utils/monitoring.py`):
+
+* **Data quality:** did the expected rows, states and years arrive, and how many nulls?
+* **Feature drift:** `|mean(latest year) − mean(earlier years)| / std(earlier years)` for each forecaster feature. Above 0.5 std counts as drift. The model is then being asked about conditions it has rarely seen.
+* **Prediction sanity:** mean, min and max predicted growth.
+
+**Model registry, champion/challenger:** each run registers a new version of
+`state_revenue_forecaster`. `promote_if_better()` moves the `champion` alias only when
+the new version's test MAPE is *lower* than the current champion's. Otherwise it stays a challenger.
 
 ```bash
-# Install dependencies
-pip install -e ".[dev]"
-
-# Run tests with coverage
-pytest tests/ -v --cov=src --cov-report=html
-
-# Run linter
-ruff check src/ tests/
+uv run mlflow ui --backend-store-uri sqlite:///mlflow.db     # http://127.0.0.1:5000
 ```
 
----
+## Dashboard
 
-## Output Tables Summary
+```bash
+uv run python -m dashboard.app                               # http://127.0.0.1:8050
+```
 
-| Table | Content |
-|-------|---------|
-| `bronze.state_finances_raw` | Raw ingested data |
-| `silver.state_finances` | Cleaned, deduplicated, imputed |
-| `gold.state_finances_features` | 60+ ML features |
-| `gold.state_finances_features_anomaly_scores` | Per-record anomaly flags |
-| `gold.state_finances_features_cluster_labels` | State cluster assignments |
-| `gold.state_finances_features_optimal_allocations` | GA budget recommendations |
+A multi-page app (`dash.register_page`) that reads the pipeline's Parquet outputs with pandas
+and MLflow with the MLflow client. It doesn't start Spark: the heavy work is already done.
 
----
+| Page | What you can do | Components |
+|---|---|---|
+| **Overview** | Headline KPIs; compare any metric over time for chosen states | `Select` (metric), `MultiSelect` (states), `LineChart`, AG Grid |
+| **Revenue Forecast** | Model vs baselines; next-year forecast per state; one state's history plus forecast | `MultiSelect`, `Select` (weakest/strongest), `BarChart`, AG Grid |
+| **Peer Clusters** | Cluster cards; peer benchmark table; how a state differs from its peers | `Select` (cluster, state), `MultiSelect` (features), AG Grid with coloured gaps |
+| **Anomaly Audit** | Filter the audit list by state, metric and years | `MultiSelect` ×2, `Select`, `RangeSlider`, `BarChart`, AG Grid |
+| **Model Monitoring** | Run history, metric trend across runs, drift chart with threshold, model registry | grouped `Select`, `LineChart`, `BarChart`, AG Grid |
 
-## Key Features by Model
+Pages rebuild on every visit, so re-running the pipeline and refreshing the browser shows the new results.
 
-### Model A — Fiscal Forecaster
-- Distributed per-state training via PySpark Pandas UDF
-- Prophet handles structural breaks (policy changes, recessions)
-- XGBoost captures non-linear lag relationships
-- MLflow grid search with automatic champion registration
+## How to run
 
-### Model B — Anomaly Detector
-- Isolation Forest: no distributional assumptions, fast at scale
-- Autoencoder: learns "normal state fiscal DNA", flags reconstruction errors
-- Ensemble score combines both for higher precision
-- Severity tiers: `critical → high → normal → clean`
+Requirements: Python 3.12, Java 17 or 21, and [uv](https://docs.astral.sh/uv/).
 
-### Model C — State Clustering
-- Native PySpark ML KMeans (distributed, no data collection to driver)
-- Silhouette + inertia elbow for optimal K
-- Human-readable cluster archetypes (post-hoc labelling)
-- Peer-state lookup API for benchmarking
+```bash
+uv sync                                  # install dependencies
+uv run python main.py                    # pipeline + MLflow tracking (~2 minutes)
+uv run python -m dashboard.app           # dashboard  -> http://127.0.0.1:8050
+uv run mlflow ui --backend-store-uri sqlite:///mlflow.db   # MLflow UI -> http://127.0.0.1:5000
+uv run pytest                            # 23 tests (~2 minutes)
+```
 
-### Model D — Resource Optimizer
-- Genetic Algorithm with Pareto-optimal multi-objective fitness
-- Configurable objective weights (welfare vs. infrastructure vs. debt)
-- Hard constraint enforcement per budget category
-- Sensitivity analysis: how does optimal allocation shift with priority weights?
+Always use the project's own environment (`uv run ...`, or `source .venv/bin/activate` first).
+A conda `(base)` Python doesn't have the right packages (e.g. `dash_ag_grid`) and will fail to import them.
 
----
+All settings (paths, Spark memory, train/validation/test years, hyper-parameter
+grid, k range, anomaly threshold, MLflow, drift threshold, dashboard port) are in
+`config/config.yaml`, with a comment explaining each choice.
 
+## Project structure
+
+```text
+config/config.yaml                  all tunable settings
+data/raw/finance.csv                source data
+main.py                             runs the pipeline, logs everything to MLflow
+src/data/ingestion.py               Stage 1: load, clean, validate
+src/features/feature_engineering.py Stage 2: ratios and growth features
+src/models/fiscal_forecaster.py     Stage 3a: RandomForest revenue forecaster
+src/models/state_clustering.py      Stage 3b: KMeans peer groups + benchmark
+src/models/anomaly_detector.py      Stage 3c: robust z-score anomalies
+src/utils/spark_utils.py            config, SparkSession, parquet/CSV I/O
+src/utils/mlflow_utils.py           MLflow setup, logging, champion/challenger promotion
+src/utils/monitoring.py             data quality, feature drift, prediction summary
+dashboard/app.py                    Dash app shell (header, navigation, page container)
+dashboard/data.py                   reads pipeline outputs and MLflow for the pages
+dashboard/components.py             shared cards, sections, AG Grid defaults, formatters
+dashboard/pages/                    overview, forecast, clusters, anomalies, monitoring
+dashboard/assets/dmc_functions.js   chart value formatters (functions-as-props)
+tests/                              pytest tests (synthetic data)
+output/, mlflow.db, mlartifacts/    generated — not committed
+```
+
+## Limitations and next steps
+
+* 21 years × 50 states is a small dataset. Adding economic drivers such as state GDP, unemployment and population would help the forecaster more than a more complex model would.
+* Anomalies are *statistically unusual*, not proof of fraud. Some are real policy events (debt refinancing, new bond programmes), which is why each flag comes with its reason.
+* Dollar amounts are nominal. Adjusting for inflation would make long-run comparisons fairer.
